@@ -1,0 +1,29 @@
+This is a libvirt hook that will let you apply custom TC rules.
+
+Currently it hooks into the vm start/vm stop events and applys rules defined on start of the vm and removes the rules on shutdown.
+
+It Currently does:
+   1.) Limit total bandwidth to 100mbit
+   2.) Limit bandwidth for 'small packets' (mtu < 100) to 500kbit
+   3.) Disable ipv6
+   4.) Disable LMNR
+
+TODO:
+ 1.) Create a master qdisk that polices all vm traffic to a % of the servers overall bandwidth
+ 2.) Parse the openstack flavor name from the libvirt xml and apply different policies
+
+Install:
+
+1.) Copy qemu-hook to /etc/libvirt/hooks/qemu
+
+2.) chmod 644 /etc/libvirt/qemu/hook
+
+3.) Reload libvirt so that it will process the libvirt hook file:
+systemctl reload libvirtd
+
+Any vm's will have the TC rules applied to them on start.
+You can backfill existing VM's via the set_bw_limit.sh script.
+You can remove all limits via the del_bw_limit.sh script.
+
+This hook was developed by Kurt Payne (kpayne@godaddy.com) and Jim Gorz (jgorz@godaddy.com)
+It was based on the hook found here: https://github.com/rhardouin/libvirt_hooks

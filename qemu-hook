@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+
+import subprocess
+import sys
+import xml.etree.ElementTree as etree
+import syslog
+import random
+import string
+
+# Start syslog
+syslog.openlog(ident='libvirt-qemu-hook', logoption=syslog.LOG_PID)
+
+def randomhex(length):
+    """ Get random word
+    """
+    s = list('0123456789abcdef')
+    return ''.join(random.sample(s,length))
+
+def call(args):
+    """ Wrap system calls so that they are logged first
+    """
+    syslog.syslog("About to execute %s " % ' '.join(args))
+    subprocess.check_call(args, stderr=subprocess.STDOUT)
+
+def find_tc():
+    """ Return the system path to the 'tc' command
+    """
+    which_out = subprocess.check_output(['which', 'tc'])
+    tc_path = which_out.encode().replace('\n', '')
+    return tc_path
+
+def tc_start(tap_name, ifb_name, tc_path):
+    """ Apply tc rules to:
+        1.) Limit total bandwidth to 100mbit
+        2.) Limit bandwidth for 'small packets' (mtu < 100) to 500kbit
+        3.) Disable ipv6
+        4.) Disable LMNR
+        This matches Vertigo (VPH3) rules:
+        https://github.secureserver.net/Aries/vertigo/blob/master/utilities/rateLimiting/manageRate.py#L24-L38
+    """
+    # Create random ids
+    # I don't believe they HAVE to be uniqe, special or different, as they are only used to differentiate rules within the domain
+    # of a given network device.  I have chosen to make them unique only because I wanted to remove the possiblity of *THAT* causing
+    # a problem while researching this problem
+    root_id1 = randomhex(4)
+    root_id2 = randomhex(4)
+
+    commands = [
+        # Create a root htb qdisc
+        [tc_path, 'qdisc', 'add', 'dev', ifb_name, 'root', 'handle', root_id1 + ':', 'htb', 'default', '30'],
+
+        # Create a root class with a 101mbit limit (it must be bigger than the sum of the children's bw limits)
+        # or we'll get warnings about quantums and r2 and other arcane nonsense
+        [tc_path, 'class', 'add', 'dev', ifb_name, 'parent', root_id1 + ':', 'classid', root_id1 + ':10', 'htb', 'rate', '101mbit'],
+
+        # Create a slow-lane (default for all traffic)
+        [tc_path, 'class', 'add', 'dev', ifb_name, 'parent', root_id1 + ':10', 'classid', root_id1 + ':20', 'htb', 'rate', '0.5mbit'],
+
+        # Create a fast-lane
+        [tc_path, 'class', 'add', 'dev', ifb_name, 'parent', root_id1 + ':10', 'classid', root_id1 + ':30', 'htb', 'rate', '100mbit'],
+
+        # Drop IPV6 packets
+        [tc_path, 'filter', 'add', 'dev', ifb_name, 'parent', root_id1 + ':', 'protocol', 'ipv6', 'prio', '10', 'u32', 'match', 'ip', 'protocol', '0', '1', 'police', 'mtu', '1', 'drop', 'flowid', ':1'],
+        [tc_path, 'filter', 'add', 'dev', ifb_name, 'parent', root_id1 + ':', 'protocol', 'ipv6', 'prio', '10', 'u32', 'match', 'ip', 'protocol', '1', '1', 'police', 'mtu', '1', 'drop', 'flowid', ':1'],
+
+        # Drop LMNR packets
+        [tc_path, 'filter', 'add', 'dev', ifb_name, 'parent', root_id1 + ':', 'protocol', 'ip', 'prio', '20', 'u32', 'match', 'ip', 'dport', '5355', '0xffff', 'police', 'mtu', '1', 'drop', 'flowid', ':1'],
+
+        # Any packets > 100 bytes will go to the fast lane, all other traffic goes to the slow lane
+        [tc_path, 'filter', 'add', 'dev', ifb_name, 'parent', root_id1 + ':', 'prio', '30', 'u32', 'match', 'ip', 'tos', '0', '0', 'police', 'mtu', '100', 'continue', 'classid', root_id1 + ':20'],
+
+        # Limit ingress traffic to VM (aka egress to the tap port on the virtual switch) to 100mbit to simulate a 100mbit NIC
+        [tc_path, 'qdisc', 'add', 'dev', tap_name, 'root', 'handle', root_id2 + ':', 'htb', 'default', '10'],
+        [tc_path, 'class', 'add', 'dev', tap_name, 'parent', root_id2 + ':', 'classid', root_id2 + ':10', 'htb', 'rate', '100mbit']
+    ]
+    for cmd in commands:
+        try:
+            call(cmd)
+        except subprocess.CalledProcessError as e:
+            syslog.syslog("Unable to apply tc rules: device=%s" % device_name)
+            syslog.syslog("Output: %s" % e.output)
+
+def tc_reset(tap_name, ifb_name, tc_path):
+    """ Reset the tap device and ifb device by removing any tc rules
+    """
+    commands = [
+        [tc_path, 'qdisc', 'del', 'dev', ifb_name, 'root'],
+        [tc_path, 'qdisc', 'del', 'dev', tap_name, 'root']
+    ]
+    for cmd in commands:
+        try:
+            call(cmd)
+        except subprocess.CalledProcessError as e:
+            syslog.syslog("Unable to reset tc rules: tap=%s ifb=%s" % (tap_name, ifb_name))
+            syslog.syslog("Output: %s" % e.output)
+
+def get_ifb(tc_path, tap_name):
+    """ Create/retrieve an IFB for this tap
+    """
+    ifb_name = tap_name.replace('tap', 'ifb')
+    try:
+        # Load the ifb module, get an IFB
+        call(['modprobe', 'ifb', 'numifbs=0'])
+
+    except subprocess.CalledProcessError as e:
+        syslog.syslog("Unable get an ifb from the kernel: tap=%s ifb=%s" % (tap_name, ifb_name))
+        syslog.syslog("Output: %s" % e.output)
+        return False
+
+    # Delete the existing IFB ... do not care if it fails
+    try:
+        call(['ip', 'link', 'delete', 'dev', ifb_name])
+    except subprocess.CalledProcessError as e:
+        pass
+
+    commands = [
+        # Link our IFB to our tap
+        ['ip', 'link', 'add', 'name', ifb_name, 'type', 'ifb'],
+
+        # Turn on the IFB link
+        ['ip', 'link', 'set', ifb_name, 'up'],
+    ]
+
+    for cmd in commands:
+        try:
+            call(cmd)
+        except subprocess.CalledProcessError as e:
+            syslog.syslog("Unable to add our IFB: tap=%s ifb=%s" % (tap_name, ifb_name))
+            syslog.syslog("Output: %s" % e.output)
+            return False
+
+    commands = [
+        # Add an ingress qdisc
+        [tc_path, 'qdisc', 'del', 'dev', tap_name, 'ingress'],
+        [tc_path, 'qdisc', 'add', 'dev', tap_name, 'handle', 'ffff:', 'ingress'],
+    ]
+
+    for cmd in commands:
+        try:
+            call(cmd)
+        except subprocess.CalledProcessError as e:
+            syslog.syslog("Unable to clear tc rules for IFB: tap=%s ifb=%s" % (tap_name, ifb_name))
+            syslog.syslog("Output: %s" % e.output)
+
+    # Link the ingress on the tap to the egress on the ifb
+    try:
+        call([tc_path, 'filter', 'add', 'dev', tap_name, 'parent', 'ffff:', 'protocol', 'ip', 'u32', 'match', 'u32', '0', '0', 'action', 'mirred', 'egress', 'redirect', 'dev', ifb_name])
+    except subprocess.CalledProcessError as e:
+        syslog.syslog("Unable to clear tc rules for IFB: tap=%s ifb=%s" % (tap_name, ifb_name))
+        syslog.syslog("Output: %s" % e.output)
+
+    # Done
+    return ifb_name
+
+def main():
+    """ Do a few things:
+        1.) Error check
+        2.) Run only on 'started' hook
+        3.) Reset any existing tc rules
+        4.) Apply the bw/packet limiting tc rules
+    """
+    syslog.syslog("Arguments: %s" % sys.argv)
+
+    # Error check
+    if len(sys.argv) < 3:
+        syslog.syslog("Nothing to do: too few arguments")
+        sys.exit()
+
+    guest_name = sys.argv[1]
+    action = sys.argv[2]
+
+    # Only take action on the 'started' hook
+    # Any other action we might care about (e.g. vm is shutdown) will
+    # destroy the tap and associated tc rules
+    if action != 'started':
+        syslog.syslog("Nothing to do: only started is hooked")
+        sys.exit()
+
+    # Read the libvirt XML, loop for the network bridge device
+    xml = sys.stdin.read()
+    root = etree.fromstring(xml)
+    if_nodes = root.findall(".//interface[@type='bridge']")
+
+    # Find tc
+    tc_path = find_tc()
+
+    # Loop through the network devices
+    for if_node in if_nodes:
+        dev_node = if_node.find('./target')
+        tap_name = dev_node.attrib['dev']
+
+        # Get the IFB (intmerdiate functional block device) ... this creates a buffer in front of the
+        # ingress flow on the virtual switch port so we can address the egress flow on the IFB instead
+        # of the ingress flow on the tap port ... there are limits on using tc with ingress flows
+        ifb_name = get_ifb(tc_path, tap_name)
+
+        # If we got an IFB, continue
+        if ifb_name:
+
+            # Tear down any existing tc rules
+            tc_reset(tap_name, ifb_name, tc_path)
+
+            # Setup the proper tc rules
+            tc_start(tap_name, ifb_name, tc_path)
+
+# Main
+if __name__ == '__main__':
+    main()
