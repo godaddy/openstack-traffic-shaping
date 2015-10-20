@@ -35,8 +35,6 @@ def tc_start(tap_name, ifb_name, tc_path):
         2.) Limit bandwidth for 'small packets' (mtu < 100) to 500kbit
         3.) Disable ipv6
         4.) Disable LMNR
-        This matches Vertigo (VPH3) rules:
-        https://github.secureserver.net/Aries/vertigo/blob/master/utilities/rateLimiting/manageRate.py#L24-L38
     """
     # Create random ids
     # I don't believe they HAVE to be uniqe, special or different, as they are only used to differentiate rules within the domain
